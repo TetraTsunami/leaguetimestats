@@ -1,0 +1,2 @@
+requests==2.27.*
+click==8.1.*
