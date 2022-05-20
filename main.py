@@ -1,8 +1,9 @@
+import asyncio
 import logging
 import time
 
+import aiohttp
 import click
-import requests
 
 
 class Summoner:
@@ -34,8 +35,6 @@ class RateLimit:
             )
             time.sleep((self.interval - (now - self.last_call)) / 1000)
             self.uses = 0
-        elif now - self.last_call >= (self.interval / self.limit):
-            self.uses -= 1
         self.last_call = time.time()
 
 
@@ -93,20 +92,20 @@ def main(server, summonername, apikey, verbose):
         logger.setLevel(logging.DEBUG)
     try:
         summoner = getSummoner(server, summonername, apikey)
-        logger.info(f"Summoner '{summoner.name}' with puuid '{summoner.puuid}' found")
+        logger.info(f"Found Summoner '{summoner.name}' with puuid '{summoner.puuid}'")
     except Exception as e:
-        logger.error(f"Failed to get summoner: {e}: {e.__traceback__}")
+        logger.error(f'Failed to get summoner: {e}')
         return
     try:
         matches = getMatches(server, summoner.puuid, apikey)
-        logger.info(f"{len(matches)} matches found")
+        logger.info(f"Found {len(matches)} matches")
     except Exception as e:
-        logger.error(f"Failed to get matches: {e}: {e.__traceback__}")
+        logger.error(f"Failed to get matches: {e}")
         return
     try:
-        hours = sumDurationAsHours(server, matches, apikey)
+        hours = asyncio.run(sumDurationAsHours(server, matches, apikey))
     except Exception as e:
-        logger.error(f"Failed to sum time: {e}: {e.__traceback__}")
+        logger.error(f"Failed to sum time: {e}")
         return
     formattedHours = formatHours(hours)
     click.echo(f"{summoner.name} has played League Of Legends for {formattedHours}")
@@ -118,44 +117,72 @@ def check_ratelimit():
 
 
 def formatHours(hours):
-    hours = round(hours, 2)
-    minutes = int((hours % 1) * 60)
+    hours = round(hours, 5)
+    minutes = (hours % 1) * 60
+    seconds = int((minutes % 1) * 60)
     hours = int(hours)
-    return f"{hours}h {minutes}m"
+    minutes = int(minutes)
+    return f"{hours}h {minutes}m {seconds}s"
 
-
-def sumDurationAsHours(server, matches, apikey):
+async def sumDurationAsHours(server, matches, apikey):
     logger.info(
-        f"Starting to sum {len(matches)} match durations (this may take a bit!)"
+        f"Starting to sum {len(matches)} match durations"
     )
-    duration = 0
-
-    for index, match in enumerate(matches):
-        if index % 20 == 0 and index != 0:
+        
+    async with aiohttp.ClientSession() as session:
+        duration = 0
+        tasks = []
+        if len(matches) > 98:
+            # If they've got a lot of matches, we'll end up subject to the 2 minute rate limit and have to go very slow.
+            estimatedTime = formatHours(len(matches) * ((120/95)/3600))
             logger.info(
-                f"Processed {index} matches, total duration: {duration} seconds. {len(matches) - index} matches left to go!"
+                f"Due to rate limits, this will take {estimatedTime} to complete"
             )
-        logger.debug(f"Processing match {index}")
-        duration += getMatchDuration(match, server, apikey)
+            for index, match in enumerate(matches):
+                if index % 20 == 0 and index != 0:
+                    estimatedTime = formatHours((len(matches) - index) * (120/95)/3600)
+                    logger.info(
+                        f"Processed {index}/{len(matches)} matches. {estimatedTime} left"
+                    )
+                await asyncio.sleep(120/95) #We can do 100 requests/120 seconds. Best to wait to avoid angering the API gods
+                tasks.append(asyncio.ensure_future(getMatchDurationAsync(session, match, server, apikey)))
+        else: 
+            # Otherwise, we're only going to be subject to the 1 minute rate limit
+            for index, match in enumerate(matches):
+                if index % 20 == 0 and index != 0:
+                    logger.info(
+                        f"Processed {index}/{len(matches)} matches."
+                    )
+                await asyncio.sleep(1/19) #We can do 20 requests/1 second. Best to wait to avoid angering the API gods
+                tasks.append(asyncio.ensure_future(getMatchDurationAsync(session, match, server, apikey)))
+
+        times = await asyncio.gather(*tasks)
+        for time in times:
+            duration += int(time)
     return duration / 3600
 
-
-def getMatchDuration(matchid, server, apikey):
+async def getMatchDurationAsync(session, matchid, server, apikey) -> int:
     logger.debug(f"Querying match '{matchid}' in server region '{server}'")
     routing = ROUTING[server.lower()]
     url = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/{matchid}"
     headers = {"X-Riot-Token": apikey}
-    check_ratelimit()
-    response = requests.get(url=url, headers=headers)
-    response.raise_for_status()
+    async with session.get(url=url, headers=headers) as resp:
+        if resp.status == 429:
+            logger.debug(f"Rate limit exceeded. Trying again in 5 seconds")
+            await asyncio.sleep(5)
+            return await getMatchDurationAsync(session, matchid, server, apikey)
+        response = await resp.json()
+        gameDuration = int(response["info"]["gameDuration"])
+        if "gameEndTimestamp" in response["info"]:
+            return gameDuration
+        else:
+            return gameDuration / 1000
 
-    apiResponse = response.json()
-    gameDuration = apiResponse["info"]["gameDuration"]
-    if "gameEndTimestamp" in apiResponse["info"]:
-        return gameDuration
-    else:
-        return gameDuration / 1000
-
+async def asyncGet(url, headers):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url=url, headers=headers, raise_for_status=True) as resp:
+            response = await resp.json()
+            return response
 
 def getMatches(server, puuid, apikey):
     logger.debug(f"Querying matches for puuid '{puuid}' in server region '{server}'")
@@ -167,9 +194,8 @@ def getMatches(server, puuid, apikey):
     while True:
         check_ratelimit()
         url = f"https://{routing}.api.riotgames.com/lol/match/v5/matches/by-puuid/{puuid}/ids?start={nextIndex}&count=100"
-        response = requests.get(url=url, headers=headers)
-        response.raise_for_status()
-        apiResponse = response.json()
+        apiResponse = asyncio.run(asyncGet(url, headers))
+        logger.debug(f"Response: {apiResponse}")
         matches.extend(apiResponse)
         if len(apiResponse) != 100:
             break
@@ -183,10 +209,7 @@ def getSummoner(server, summonername, apikey):
     url = f"https://{server}.api.riotgames.com/lol/summoner/v4/summoners/by-name/{summonername}"
     headers = {"X-Riot-Token": apikey}
     check_ratelimit()
-    response = requests.get(url=url, headers=headers)
-    response.raise_for_status()
-
-    apiResponse = response.json()
+    apiResponse = asyncio.run(asyncGet(url, headers))
     return Summoner(apiResponse["name"], apiResponse["puuid"])
 
 
